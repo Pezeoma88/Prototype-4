@@ -1,0 +1,37 @@
+{
+  "expo": {
+    "name": "CarpoolBoard",
+    "slug": "CarpoolBoard",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "package": "com.smuc3mobilefall26.CarpoolBoard"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "0e5d81b8-c9ef-4e3a-873f-83c78eb6d72c"
+      }
+    },
+    "owner": "smu-c3-mobile-fall-26",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/0e5d81b8-c9ef-4e3a-873f-83c78eb6d72c"
+    }
+  }
+}
