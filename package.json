@@ -3,6 +3,8 @@
   "version": "1.0.0",
   "main": "index.js",
   "dependencies": {
+    "@react-native-community/datetimepicker": "9.1.0",
+    "@supabase/supabase-js": "^2.117.2",
     "expo": "~57.0.26",
     "expo-status-bar": "~57.0.1",
     "expo-updates": "~57.0.24",

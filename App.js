@@ -1,10 +1,12 @@
-import { useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { StatusBar } from 'expo-status-bar';
 import {
+  ActivityIndicator,
   Alert,
   Keyboard,
   KeyboardAvoidingView,
   Platform,
+  RefreshControl,
   SafeAreaView,
   ScrollView,
   StyleSheet,
@@ -14,6 +16,8 @@ import {
   TouchableWithoutFeedback,
   View,
 } from 'react-native';
+import DateTimePicker from '@react-native-community/datetimepicker';
+import { supabase } from './lib/supabase';
 
 // Basic email shape check (not full RFC 5322 validation): local part, "@",
 // domain, a dot, and a TLD, no spaces. Enough to reject obviously invalid
@@ -25,46 +29,130 @@ const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MIN_SEATS = 1;
 const MAX_SEATS = 7;
 
-// Sort options for Available Rides. Departure time is intentionally not one
-// of them: it's stored as free-form text (e.g. "5:30 PM", "after class"), so
-// it can't be ordered reliably until it's captured in a structured format.
+// Sort options for Available Rides. Departure Time works now that departure
+// is stored as a real timestamp (rides.departure_at) instead of free text.
 const RIDE_SORT_OPTIONS = [
   { key: 'default', label: 'Default' },
   { key: 'destination', label: 'Destination' },
+  { key: 'departure', label: 'Departure Time' },
 ];
+
+// Minute steps shown in the departure time wheel.
+const DEPARTURE_MINUTE_INTERVAL = 5;
+
+// Formats a departure Date for display, e.g. "Tue, Sep 30 · 5:30 PM". The
+// year is only added when it isn't the current year.
+function formatDeparture(date) {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
+    return 'Unknown time';
+  }
+  const dateOptions = { weekday: 'short', month: 'short', day: 'numeric' };
+  if (date.getFullYear() !== new Date().getFullYear()) {
+    dateOptions.year = 'numeric';
+  }
+  const datePart = date.toLocaleDateString('en-US', dateOptions);
+  const timePart = date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  return `${datePart} · ${timePart}`;
+}
+
+// A sensible starting value for the departure wheels: the next
+// DEPARTURE_MINUTE_INTERVAL step at least 15 minutes from now.
+function getDefaultDeparture() {
+  const step = DEPARTURE_MINUTE_INTERVAL * 60 * 1000;
+  return new Date(Math.ceil((Date.now() + 15 * 60 * 1000) / step) * step);
+}
+
+// The profiles table stores emails lowercase (profiles_email_check), so every
+// email sent to Supabase goes through this first. "  David@Email.com " and
+// "david@email.com" are the same account.
+function normalizeEmail(email) {
+  return email.trim().toLowerCase();
+}
+
+// Converts a `profiles` row into the account shape the app already uses.
+function profileToAccount(row) {
+  return { id: row.id, name: row.name, email: row.email, role: row.role };
+}
+
+// Turns Supabase rows into the `drivers` state shape the UI already renders.
+// Available seats are always derived as seat_count - accepted requests.
+function buildDriversFromRows(rideRows, requestRows, profilesById) {
+  return rideRows.map((ride) => {
+    const requests = requestRows.filter((req) => req.ride_id === ride.id);
+    const matchedRiders = requests
+      .filter((req) => req.status === 'accepted')
+      .map((req) => ({
+        id: req.rider_id,
+        requestId: req.id,
+        name: profilesById[req.rider_id]?.name || 'Unknown rider',
+      }));
+    const pendingRequests = requests
+      .filter((req) => req.status === 'pending')
+      .map((req) => ({
+        id: req.id,
+        riderId: req.rider_id,
+        name: profilesById[req.rider_id]?.name || 'Unknown rider',
+        reason: req.reason || '',
+      }));
+    const departureAt = new Date(ride.departure_at);
+    return {
+      id: ride.id,
+      driverAccountId: ride.driver_id,
+      name: profilesById[ride.driver_id]?.name || 'Unknown driver',
+      destination: ride.destination,
+      departureAt,
+      departureTime: formatDeparture(departureAt),
+      totalSeats: ride.seat_count,
+      seats: Math.max(0, ride.seat_count - matchedRiders.length),
+      matchedRiders,
+      pendingRequests,
+    };
+  });
+}
 
 // This is the home screen for CarpoolBoard.
 // Drivers can be added (with a name and seat count), riders can ask for a ride,
 // and a waiting rider can be matched to a driver's open seat.
 //
-// Accounts/roles are local-only for this class-day change (no networking or
-// Firebase): everyone signed in on this device shares the same `drivers` and
-// `riders` board state, and each person's account just decides whether they
-// see the Driver or Rider side of it. That split is what a real multi-device
-// build (one phone signed in as a Driver, another as a Rider) would plug into
-// later, once `drivers`/`riders` are backed by a real synced store instead of
-// local state.
+// Prototype 4: the board is persisted in Supabase. `profiles` holds accounts,
+// `rides` holds posted rides, and `ride_requests` holds each rider's request
+// (pending / accepted / denied / cancelled). The app reloads the whole board
+// from Supabase on launch, on pull-to-refresh, and after every change, then
+// rebuilds the same `drivers` / `riders` shapes the UI rendered before.
 export default function App() {
-  // The list of drivers that have been added so far.
+  // The list of drivers (posted rides), rebuilt from Supabase on every load.
   // Each driver is an object like
-  // { id, name, destination, departureTime, seats, matchedRiders, pendingRequests }.
-  // seats is the number of AVAILABLE seats; it only goes down when a request is accepted.
-  // matchedRiders collects { id, name } for every confirmed passenger on this ride.
-  // pendingRequests collects { id, riderId, name } for requests the driver hasn't answered yet.
+  // { id, driverAccountId, name, destination, departureAt, departureTime,
+  //   totalSeats, seats, matchedRiders, pendingRequests }.
+  // id is the ride's Supabase UUID; departureAt is a Date and departureTime
+  // its display string. seats is the number of AVAILABLE seats
+  // (totalSeats - accepted requests), so it only goes down on Accept.
+  // matchedRiders collects { id, requestId, name } for every confirmed passenger on this ride.
+  // pendingRequests collects { id, riderId, name, reason } for requests the driver hasn't answered yet.
   const [drivers, setDrivers] = useState([]);
 
-  // Local accounts for this device: { id, name, email, role }. This is a
-  // prototype, NOT secure production authentication — there's no password,
-  // no backend, and everything lives only in this session's React state.
-  // The email is the account's identifier (case-insensitive): "signing up"
-  // remembers a name + email + role, and "logging in" again with the same
-  // email reuses that same account and its original role. That's the seam a
-  // real auth/persistence layer would slot into later without changing how
-  // the rest of the app reads `currentUser`.
-  const [accounts, setAccounts] = useState([]);
+  // True until the first Supabase load finishes, so the empty state isn't
+  // shown before we actually know the board is empty.
+  const [isBoardLoading, setIsBoardLoading] = useState(true);
+  // True while a pull-to-refresh reload is running.
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  // The last load error, if any. Already-loaded rides stay on screen.
+  const [boardError, setBoardError] = useState('');
 
-  // The id of the account currently signed in, or null when signed out.
-  const [currentUserId, setCurrentUserId] = useState(null);
+  // The signed-in account: { id, name, email, role }, or null when signed
+  // out. id is the profile's stable Supabase UUID. This is a prototype, NOT
+  // secure production authentication — there's no password and no Supabase
+  // Auth. The email is the account's identifier (case-insensitive): "signing
+  // up" creates a `profiles` row with a name + email + role, and "logging in"
+  // again with the same email restores that same profile and its role.
+  const [currentUser, setCurrentUser] = useState(null);
+
+  // True while a Continue press is talking to Supabase.
+  const [isSigningIn, setIsSigningIn] = useState(false);
+
+  // The existing profile matching the email typed on the sign-in screen (or
+  // null), looked up in Supabase shortly after the user stops typing.
+  const [matchingAuthAccount, setMatchingAuthAccount] = useState(null);
 
   // The current text typed into the sign-in form, and the role toggle. Name
   // and role are only used when the email doesn't match an existing account.
@@ -79,11 +167,23 @@ export default function App() {
   // Whether the "Add Driver" form is currently showing.
   const [isAddingDriver, setIsAddingDriver] = useState(false);
 
+  // The id of the ride being edited in the Post Ride form, or null when the
+  // form is posting a new ride.
+  const [editingRideId, setEditingRideId] = useState(null);
+
   // The current text typed into the form's inputs. The driver's name isn't
   // one of them: it comes from the signed-in account when the ride is posted.
   const [destinationInput, setDestinationInput] = useState('');
-  const [departureTimeInput, setDepartureTimeInput] = useState('');
   const [seatsInput, setSeatsInput] = useState('');
+
+  // The departure picked on the date/time wheels (a Date), or null until the
+  // driver picks one. Saved to Supabase as rides.departure_at.
+  const [departureAtInput, setDepartureAtInput] = useState(null);
+  // When editing, the ride's original departure, so an unchanged (possibly
+  // already-past) departure doesn't block saving other edits.
+  const [originalDepartureAt, setOriginalDepartureAt] = useState(null);
+  // Which wheel is open: 'date', 'time', or null when neither is showing.
+  const [departurePickerMode, setDeparturePickerMode] = useState(null);
 
   // A validation message to show under the form, if something is wrong.
   const [formError, setFormError] = useState('');
@@ -98,9 +198,43 @@ export default function App() {
   // Lets us scroll back to the top (Available Rides) after saving a ride.
   const scrollViewRef = useRef(null);
 
-  // The list of riders who need a ride so far.
-  // Each rider is an object like { id, name }.
-  const [riders, setRiders] = useState([]);
+  // Riders who joined Looking for a Ride on this device without sending a
+  // request yet: { id, name }. There's no Supabase table for the waiting
+  // list itself, so these entries last only for this app session. Riders
+  // with a pending request are rebuilt from Supabase instead (see `riders`).
+  const [localWaitingRiders, setLocalWaitingRiders] = useState([]);
+
+  // Every request row with status pending/accepted, from the last load. Used
+  // to rebuild Looking for a Ride.
+  const [activeRequestRows, setActiveRequestRows] = useState([]);
+  // Profiles referenced by the loaded rides/requests, keyed by id.
+  const [profilesById, setProfilesById] = useState({});
+
+  // Guards against a fast double-tap firing the same Supabase change twice.
+  const isBoardActionRunningRef = useRef(false);
+
+  // Looking for a Ride, rebuilt as { id, name }: everyone with a pending
+  // request in Supabase, plus anyone who joined on this device, minus anyone
+  // who already has a confirmed (accepted) seat.
+  const confirmedRiderIds = new Set(
+    activeRequestRows.filter((req) => req.status === 'accepted').map((req) => req.rider_id)
+  );
+  const riders = [];
+  for (const req of activeRequestRows) {
+    if (req.status === 'pending' && !riders.some((r) => r.id === req.rider_id)) {
+      riders.push({ id: req.rider_id, name: profilesById[req.rider_id]?.name || 'Unknown rider' });
+    }
+  }
+  for (const rider of localWaitingRiders) {
+    if (!riders.some((r) => r.id === rider.id)) {
+      riders.push(rider);
+    }
+  }
+  for (let i = riders.length - 1; i >= 0; i -= 1) {
+    if (confirmedRiderIds.has(riders[i].id)) {
+      riders.splice(i, 1);
+    }
+  }
 
   // Whether the "Request a Ride" panel is currently showing. The rider's
   // name comes from their signed-in account, so the panel has no inputs.
@@ -123,24 +257,132 @@ export default function App() {
   // The id of the driver whose Ride Details screen is currently open, or null if none.
   const [selectedRideDriverId, setSelectedRideDriverId] = useState(null);
 
-  // The signed-in account, or null when nobody is signed in yet.
-  const currentUser = accounts.find((account) => account.id === currentUserId) || null;
+  // Loads the whole board from Supabase: rides, their pending/accepted
+  // requests, and the profiles those rows point at. On failure the rides
+  // already on screen are kept and an error message is shown instead.
+  const loadBoard = useCallback(async () => {
+    try {
+      const { data: rideRows, error: ridesError } = await supabase
+        .from('rides')
+        .select('id, driver_id, destination, departure_at, seat_count, created_at')
+        .order('created_at', { ascending: true })
+        .order('id', { ascending: true });
+      if (ridesError) throw ridesError;
 
-  // Live-matches the sign-in email field against existing accounts, so the
-  // form can show a "welcome back" notice and skip the name/role fields
-  // before the user even presses Continue.
-  const trimmedAuthEmail = authEmailInput.trim().toLowerCase();
-  const matchingAuthAccount = trimmedAuthEmail
-    ? accounts.find((account) => account.email.toLowerCase() === trimmedAuthEmail) || null
-    : null;
+      const { data: requestRows, error: requestsError } = await supabase
+        .from('ride_requests')
+        .select('id, ride_id, rider_id, reason, status, created_at')
+        .in('status', ['pending', 'accepted'])
+        .order('created_at', { ascending: true });
+      if (requestsError) throw requestsError;
+
+      const profileIds = [
+        ...new Set([
+          ...rideRows.map((ride) => ride.driver_id),
+          ...requestRows.map((req) => req.rider_id),
+        ]),
+      ];
+      let profileMap = {};
+      if (profileIds.length > 0) {
+        const { data: profileRows, error: profilesError } = await supabase
+          .from('profiles')
+          .select('id, name, email, role')
+          .in('id', profileIds);
+        if (profilesError) throw profilesError;
+        profileMap = Object.fromEntries(profileRows.map((row) => [row.id, row]));
+      }
+
+      setProfilesById(profileMap);
+      setActiveRequestRows(requestRows);
+      setDrivers(buildDriversFromRows(rideRows, requestRows, profileMap));
+      setBoardError('');
+      return true;
+    } catch (error) {
+      console.warn('CarpoolBoard: failed to load board from Supabase', error);
+      setBoardError("Couldn't load rides from the server. Pull down to try again.");
+      return false;
+    } finally {
+      setIsBoardLoading(false);
+    }
+  }, []);
+
+  // Restore the board from Supabase as soon as CarpoolBoard launches.
+  useEffect(() => {
+    loadBoard();
+  }, [loadBoard]);
+
+  // Pull-to-refresh: fetch the latest board without restarting the app.
+  async function handleRefresh() {
+    setIsRefreshing(true);
+    await loadBoard();
+    setIsRefreshing(false);
+  }
+
+  // Runs one Supabase change at a time (ignoring double-taps), then reloads
+  // the board so the UI always reflects what's actually stored.
+  async function runBoardAction(action) {
+    if (isBoardActionRunningRef.current) {
+      return;
+    }
+    isBoardActionRunningRef.current = true;
+    try {
+      await action();
+    } finally {
+      isBoardActionRunningRef.current = false;
+      await loadBoard();
+    }
+  }
+
+  // Looks up a profile by email (case-insensitive, via normalizeEmail).
+  // Returns the account or null; throws on a network/database error.
+  async function findProfileByEmail(email) {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('id, name, email, role')
+      .eq('email', normalizeEmail(email))
+      .limit(1);
+    if (error) throw error;
+    return data.length > 0 ? profileToAccount(data[0]) : null;
+  }
+
+  // Live-matches the sign-in email field against existing profiles in
+  // Supabase, so the form can show a "welcome back" notice and skip the
+  // name/role fields before the user even presses Continue. The lookup waits
+  // until typing pauses, and ignores results for an email that's since changed.
+  const trimmedAuthEmail = normalizeEmail(authEmailInput);
+  useEffect(() => {
+    setMatchingAuthAccount(null);
+    if (currentUser !== null || !EMAIL_PATTERN.test(trimmedAuthEmail)) {
+      return undefined;
+    }
+    let isStale = false;
+    const timer = setTimeout(() => {
+      findProfileByEmail(trimmedAuthEmail)
+        .then((account) => {
+          if (!isStale) setMatchingAuthAccount(account);
+        })
+        .catch(() => {
+          // Continue will retry the lookup and report any real error.
+        });
+    }, 400);
+    return () => {
+      isStale = true;
+      clearTimeout(timer);
+    };
+  }, [trimmedAuthEmail, currentUser]);
 
   // Runs when the user presses "Continue" on the sign-in screen. An email
-  // that matches an existing account logs back into it (keeping the name and
+  // that matches an existing profile logs back into it (keeping the name and
   // role on file); a new email requires a name and role to create a new
-  // local account. Email (not name) is the account identifier.
-  function handleSignIn() {
+  // profile in Supabase. Email (not name) is the account identifier.
+  async function handleSignIn() {
+    if (isSigningIn) {
+      return;
+    }
     const trimmedName = authNameInput.trim();
-    const trimmedEmail = authEmailInput.trim();
+    // Normalized so lookup and insert both use the lowercase form Supabase
+    // requires. The text field itself still shows what the user typed.
+    const trimmedEmail = normalizeEmail(authEmailInput);
 
     if (trimmedEmail === '') {
       setAuthError('Please enter your email address.');
@@ -151,37 +393,50 @@ export default function App() {
       return;
     }
 
-    const existingAccount = accounts.find(
-      (account) => account.email.toLowerCase() === trimmedEmail.toLowerCase()
-    );
+    setIsSigningIn(true);
+    try {
+      let account = await findProfileByEmail(trimmedEmail);
 
-    if (existingAccount) {
-      setCurrentUserId(existingAccount.id);
-    } else {
-      if (trimmedName === '') {
-        setAuthError('Please enter your name.');
-        return;
+      if (!account) {
+        if (trimmedName === '') {
+          setAuthError('Please enter your name.');
+          return;
+        }
+        const { data, error } = await supabase
+          .from('profiles')
+          .insert({ name: trimmedName, email: trimmedEmail, role: authRole })
+          .select('id, name, email, role')
+          .single();
+        if (error) {
+          // 23505 = unique violation: the email was registered in the
+          // meantime (e.g. from another phone), so just log into that one.
+          if (error.code === '23505') {
+            account = await findProfileByEmail(trimmedEmail);
+          }
+          if (!account) throw error;
+        } else {
+          account = profileToAccount(data);
+        }
       }
-      const newAccount = {
-        id: Date.now(),
-        name: trimmedName,
-        email: trimmedEmail,
-        role: authRole,
-      };
-      setAccounts((current) => [...current, newAccount]);
-      setCurrentUserId(newAccount.id);
-    }
 
-    setAuthNameInput('');
-    setAuthEmailInput('');
-    setAuthError('');
+      setCurrentUser(account);
+      setAuthNameInput('');
+      setAuthEmailInput('');
+      setAuthError('');
+      loadBoard();
+    } catch (error) {
+      console.warn('CarpoolBoard: sign-in failed', error);
+      setAuthError("Couldn't reach CarpoolBoard's server. Check your connection and try again.");
+    } finally {
+      setIsSigningIn(false);
+    }
   }
 
   // Signs the current account out. The shared board (drivers/riders) is left
   // untouched so the next person to sign in still sees the same board.
   function handleSignOut() {
-    setCurrentUserId(null);
-    setIsAddingDriver(false);
+    setCurrentUser(null);
+    resetForm();
     setIsAddingRider(false);
     setSelectedRideDriverId(null);
     setReservingDriverId(null);
@@ -208,36 +463,107 @@ export default function App() {
     setIsAddingDriver(true);
   }
 
+  // Opens the same Post Ride form pre-filled with one of the signed-in
+  // driver's rides, so they can change its destination, departure, or seats.
+  function handleStartEditRide(driverId) {
+    const driver = drivers.find((d) => d.id === driverId);
+    if (!driver || !currentUser || driver.driverAccountId !== currentUser.id) {
+      return;
+    }
+    setEditingRideId(driver.id);
+    setDestinationInput(driver.destination);
+    setDepartureAtInput(driver.departureAt);
+    setOriginalDepartureAt(driver.departureAt);
+    setSeatsInput(String(driver.totalSeats));
+    setDeparturePickerMode(null);
+    setFormError('');
+    setSelectedRideDriverId(null);
+    setReservingDriverId(null);
+    setRequestNotice('');
+    setIsAddingDriver(true);
+    // The form sits below Available Rides; bring it into view once rendered.
+    setTimeout(() => scrollViewRef.current?.scrollToEnd({ animated: true }), 150);
+  }
+
   // Closes the form and clears out anything the user typed.
   function resetForm() {
     setIsAddingDriver(false);
+    setEditingRideId(null);
     setDestinationInput('');
-    setDepartureTimeInput('');
+    setDepartureAtInput(null);
+    setOriginalDepartureAt(null);
+    setDeparturePickerMode(null);
     setSeatsInput('');
     setFormError('');
     setIsSubmittingDriver(false);
   }
 
-  // Runs when the user presses "Post Ride". The ride is posted under the
-  // signed-in account's name, so the driver never has to type it.
-  function handleSaveDriver() {
+  // Shows (or hides, if it's already showing) the date or time wheel.
+  // The first time a wheel opens, it starts from a near-future default.
+  function handleToggleDeparturePicker(mode) {
+    Keyboard.dismiss();
+    if (departureAtInput === null) {
+      setDepartureAtInput(getDefaultDeparture());
+    }
+    setDeparturePickerMode((current) => (current === mode ? null : mode));
+  }
+
+  // Called as the driver scrolls a wheel. The date wheel only changes the
+  // day and the time wheel only changes the hour/minute, so the two picks
+  // combine into one departure Date.
+  function handleDeparturePicked(pickedDate) {
+    if (!(pickedDate instanceof Date) || Number.isNaN(pickedDate.getTime())) {
+      return;
+    }
+    const mode = departurePickerMode;
+    setDepartureAtInput((current) => {
+      const combined = new Date(current || getDefaultDeparture());
+      if (mode === 'date') {
+        combined.setFullYear(pickedDate.getFullYear(), pickedDate.getMonth(), pickedDate.getDate());
+      } else {
+        combined.setHours(pickedDate.getHours(), pickedDate.getMinutes(), 0, 0);
+      }
+      return combined;
+    });
+    // Android shows the picker as a one-shot dialog, so close it after a pick.
+    if (Platform.OS !== 'ios') {
+      setDeparturePickerMode(null);
+    }
+  }
+
+  // Runs when the user presses "Post Ride" (or "Save Changes" when editing).
+  // The ride is posted under the signed-in account's name, so the driver
+  // never has to type it. The ride is written to Supabase, then the board
+  // is reloaded from Supabase.
+  async function handleSaveDriver() {
     // Guards against a fast double-tap posting the same ride twice.
     if (isSubmittingDriver || !currentUser) {
       return;
     }
 
     const trimmedDestination = destinationInput.trim();
-    const trimmedDepartureTime = departureTimeInput.trim();
     const seatsNumber = Number(seatsInput.trim());
+    const editingDriver =
+      editingRideId !== null ? drivers.find((d) => d.id === editingRideId) || null : null;
+    const departureUnchanged =
+      editingDriver !== null &&
+      departureAtInput !== null &&
+      originalDepartureAt !== null &&
+      departureAtInput.getTime() === originalDepartureAt.getTime();
 
-    // Validation: destination and departure time can't be empty, and seats
-    // must be a whole number from MIN_SEATS to MAX_SEATS.
+    // Validation: destination can't be empty, a departure must be picked and
+    // be in the future, and seats must be a whole number from MIN_SEATS to
+    // MAX_SEATS. When editing, an unchanged departure is allowed as-is.
     if (trimmedDestination === '') {
       setFormError('Please enter a destination.');
       return;
     }
-    if (trimmedDepartureTime === '') {
-      setFormError('Please enter a departure time.');
+    if (departureAtInput === null || Number.isNaN(departureAtInput.getTime())) {
+      setFormError('Please choose a departure date and time.');
+      return;
+    }
+    if (!departureUnchanged && departureAtInput.getTime() <= Date.now()) {
+      setFormError('Departure must be in the future. Please pick a later date or time.');
       return;
     }
     if (
@@ -249,26 +575,72 @@ export default function App() {
       setFormError(`Seats must be between ${MIN_SEATS} and ${MAX_SEATS}.`);
       return;
     }
+    if (editingRideId !== null && !editingDriver) {
+      setFormError('This ride no longer exists. It may have been removed.');
+      return;
+    }
 
     setIsSubmittingDriver(true);
+    setFormError('');
 
-    // Add the new driver to the list, keeping all the existing drivers.
-    const newDriver = {
-      id: Date.now(),
-      driverAccountId: currentUser.id,
-      name: currentUser.name,
-      destination: trimmedDestination,
-      departureTime: trimmedDepartureTime,
-      seats: seatsNumber,
-      matchedRiders: [],
-      pendingRequests: [],
-    };
-    setDrivers((current) => [...current, newDriver]);
+    try {
+      if (editingDriver) {
+        // Re-check confirmed riders against the server right before saving,
+        // so total seats can't drop below who's already been accepted.
+        const { count: acceptedCount, error: countError } = await supabase
+          .from('ride_requests')
+          .select('id', { count: 'exact', head: true })
+          .eq('ride_id', editingDriver.id)
+          .eq('status', 'accepted');
+        if (countError) throw countError;
+        if (seatsNumber < (acceptedCount ?? 0)) {
+          setFormError(
+            `This ride already has ${acceptedCount} confirmed rider${acceptedCount === 1 ? '' : 's'}, ` +
+              `so it needs at least ${acceptedCount} seat${acceptedCount === 1 ? '' : 's'}.`
+          );
+          setIsSubmittingDriver(false);
+          return;
+        }
 
-    // Success: dismiss the keyboard, close/reset the form, and scroll back
-    // up so the new ride is visible in Available Rides right away.
+        const { data, error } = await supabase
+          .from('rides')
+          .update({
+            destination: trimmedDestination,
+            departure_at: departureAtInput.toISOString(),
+            seat_count: seatsNumber,
+          })
+          .eq('id', editingDriver.id)
+          .eq('driver_id', currentUser.id)
+          .select('id');
+        if (error) throw error;
+        if (!data || data.length === 0) {
+          throw new Error('No ride was updated.');
+        }
+      } else {
+        const { error } = await supabase.from('rides').insert({
+          driver_id: currentUser.id,
+          destination: trimmedDestination,
+          departure_at: departureAtInput.toISOString(),
+          seat_count: seatsNumber,
+        });
+        if (error) throw error;
+      }
+    } catch (error) {
+      console.warn('CarpoolBoard: saving ride failed', error);
+      setFormError(
+        editingDriver
+          ? "Couldn't save your changes. Check your connection and try again."
+          : "Couldn't post your ride. Check your connection and try again."
+      );
+      setIsSubmittingDriver(false);
+      return;
+    }
+
+    // Success: dismiss the keyboard, close/reset the form, reload the board,
+    // and scroll back up so the ride is visible in Available Rides right away.
     Keyboard.dismiss();
     resetForm();
+    await loadBoard();
     scrollViewRef.current?.scrollTo({ y: 0, animated: true });
   }
 
@@ -303,12 +675,25 @@ export default function App() {
         {
           text: 'Cancel Ride',
           style: 'destructive',
-          onPress: () => {
-            setDrivers((current) => current.filter((d) => d.id !== driverId));
-            setSelectedRideDriverId(null);
-            setReservingDriverId(null);
-            setRequestNotice('');
-          },
+          onPress: () =>
+            runBoardAction(async () => {
+              // Deleting the ride also removes its ride_requests through the
+              // database's ON DELETE CASCADE relationship.
+              const { data, error } = await supabase
+                .from('rides')
+                .delete()
+                .eq('id', driverId)
+                .eq('driver_id', currentUser.id)
+                .select('id');
+              if (error || !data || data.length === 0) {
+                console.warn('CarpoolBoard: cancelling ride failed', error);
+                setRequestNotice("Couldn't cancel this ride. Check your connection and try again.");
+                return;
+              }
+              setSelectedRideDriverId(null);
+              setReservingDriverId(null);
+              setRequestNotice('');
+            }),
         },
       ],
       { cancelable: true }
@@ -330,11 +715,11 @@ export default function App() {
 
   // SPIKE, step 1: a waiting rider requests this specific ride, optionally
   // with a short reason so the driver has context when deciding. The request
-  // is stored on the driver as Pending. Seats do NOT change yet, and the
+  // is saved to ride_requests as Pending. Seats do NOT change yet, and the
   // rider stays in the waiting list (they could still request other rides).
-  function handleRequestRide(driverId, riderId, reason) {
+  async function handleRequestRide(driverId, riderId, reason) {
     const driver = drivers.find((d) => d.id === driverId);
-    const rider = riders.find((r) => r.id === riderId);
+    const rider = currentUser && currentUser.id === riderId ? currentUser : null;
     if (!driver || !rider) {
       return;
     }
@@ -358,26 +743,67 @@ export default function App() {
       return;
     }
 
-    const newRequest = {
-      id: Date.now(),
-      riderId: rider.id,
-      name: rider.name,
-      reason: reason ? reason.trim() : '',
-    };
-    setDrivers(
-      drivers.map((d) =>
-        d.id === driverId ? { ...d, pendingRequests: [...d.pendingRequests, newRequest] } : d
-      )
-    );
-    setReservingDriverId(null);
-    setRequestReasonInput('');
-    setRequestNotice(`${rider.name}'s request is now Pending.`);
+    const trimmedReason = reason ? reason.trim() : '';
+
+    await runBoardAction(async () => {
+      // A rider who was denied, or who gave up a seat, keeps an old row for
+      // this ride. Re-requesting reopens that row as Pending instead of
+      // adding a second one.
+      const { data: existingRows, error: lookupError } = await supabase
+        .from('ride_requests')
+        .select('id, status')
+        .eq('ride_id', driverId)
+        .eq('rider_id', rider.id);
+      if (lookupError) {
+        console.warn('CarpoolBoard: request lookup failed', lookupError);
+        setRequestNotice("Couldn't send your request. Check your connection and try again.");
+        return;
+      }
+      if (existingRows.some((row) => row.status === 'accepted')) {
+        setRequestNotice(`${rider.name} is already a confirmed passenger on this ride.`);
+        return;
+      }
+      if (existingRows.some((row) => row.status === 'pending')) {
+        setRequestNotice(`${rider.name} already has a pending request for this ride.`);
+        return;
+      }
+
+      const { error } =
+        existingRows.length > 0
+          ? await supabase
+              .from('ride_requests')
+              .update({ status: 'pending', reason: trimmedReason || null })
+              .eq('id', existingRows[0].id)
+          : await supabase.from('ride_requests').insert({
+              ride_id: driverId,
+              rider_id: rider.id,
+              reason: trimmedReason || null,
+              status: 'pending',
+            });
+      if (error) {
+        // P0001 = an error raised on purpose by the database (e.g. the
+        // prevent_self_request trigger), whose message is meant for users.
+        console.warn('CarpoolBoard: sending request failed', error);
+        setRequestNotice(
+          error.code === 'P0001' && error.message
+            ? error.message
+            : "Couldn't send your request. Check your connection and try again."
+        );
+        return;
+      }
+
+      setReservingDriverId(null);
+      setRequestReasonInput('');
+      setRequestNotice(`${rider.name}'s request is now Pending.`);
+    });
   }
 
   // SPIKE, step 2a: the driver accepts a pending request.
   // The rider becomes a confirmed passenger, available seats go down by 1,
-  // and the rider leaves the waiting list (their requests to other rides are dropped).
-  function handleAcceptRequest(driverId, requestId) {
+  // and the rider leaves the waiting list (their requests to other rides are
+  // cancelled). The accept itself runs in the database's accept_ride_request
+  // function, which is what prevents overbooking.
+  async function handleAcceptRequest(driverId, requestId) {
     const driver = drivers.find((d) => d.id === driverId);
     const request = driver && driver.pendingRequests.find((req) => req.id === requestId);
     if (!driver || !request) {
@@ -395,43 +821,58 @@ export default function App() {
       return;
     }
 
-    setDrivers(
-      drivers.map((d) => {
-        if (d.id === driverId) {
-          return {
-            ...d,
-            seats: d.seats - 1,
-            matchedRiders: [...d.matchedRiders, { id: request.riderId, name: request.name }],
-            pendingRequests: d.pendingRequests.filter((req) => req.id !== requestId),
-          };
-        }
-        return {
-          ...d,
-          pendingRequests: d.pendingRequests.filter((req) => req.riderId !== request.riderId),
-        };
-      })
-    );
-    setRiders(riders.filter((rider) => rider.id !== request.riderId));
-    setRequestNotice(`${request.name} accepted: now a confirmed passenger.`);
+    await runBoardAction(async () => {
+      const { error } = await supabase.rpc('accept_ride_request', { p_request_id: requestId });
+      if (error) {
+        // P0001 = a rule enforced by accept_ride_request (e.g. the ride is
+        // full, or the request is no longer pending); its message is for users.
+        console.warn('CarpoolBoard: accepting request failed', error);
+        setRequestNotice(
+          error.code === 'P0001' && error.message
+            ? error.message
+            : "Couldn't accept this request. Check your connection and try again."
+        );
+        return;
+      }
+
+      // The rider has a seat now, so withdraw their other pending requests
+      // and take them off Looking for a Ride.
+      const { error: cleanupError } = await supabase
+        .from('ride_requests')
+        .update({ status: 'cancelled' })
+        .eq('rider_id', request.riderId)
+        .eq('status', 'pending');
+      if (cleanupError) {
+        console.warn("CarpoolBoard: cancelling rider's other requests failed", cleanupError);
+      }
+      setLocalWaitingRiders((current) => current.filter((r) => r.id !== request.riderId));
+      setRequestNotice(`${request.name} accepted: now a confirmed passenger.`);
+    });
   }
 
   // SPIKE, step 2b: the driver denies a pending request.
-  // The request is removed; seats and confirmed passengers are unchanged.
-  function handleDenyRequest(driverId, requestId) {
+  // The request is marked denied; seats and confirmed passengers are unchanged.
+  async function handleDenyRequest(driverId, requestId) {
     const driver = drivers.find((d) => d.id === driverId);
     const request = driver && driver.pendingRequests.find((req) => req.id === requestId);
     if (!driver || !request) {
       return;
     }
 
-    setDrivers(
-      drivers.map((d) =>
-        d.id === driverId
-          ? { ...d, pendingRequests: d.pendingRequests.filter((req) => req.id !== requestId) }
-          : d
-      )
-    );
-    setRequestNotice(`${request.name}'s request was denied. Seats unchanged.`);
+    await runBoardAction(async () => {
+      const { data, error } = await supabase
+        .from('ride_requests')
+        .update({ status: 'denied' })
+        .eq('id', requestId)
+        .eq('status', 'pending')
+        .select('id');
+      if (error || !data || data.length === 0) {
+        console.warn('CarpoolBoard: denying request failed', error);
+        setRequestNotice("Couldn't deny this request. It may have already changed. Pull down to refresh.");
+        return;
+      }
+      setRequestNotice(`${request.name}'s request was denied. Seats unchanged.`);
+    });
   }
 
   // A confirmed rider gives up their seat: the seat re-opens on the ride
@@ -453,23 +894,28 @@ export default function App() {
         {
           text: 'Cancel Seat',
           style: 'destructive',
-          onPress: () => {
-            setDrivers((current) =>
-              current.map((d) =>
-                d.id === driverId
-                  ? {
-                      ...d,
-                      seats: d.seats + 1,
-                      matchedRiders: d.matchedRiders.filter((r) => r.id !== riderId),
-                    }
-                  : d
-              )
-            );
-            setRiders((current) =>
-              current.some((r) => r.id === riderId) ? current : [...current, { id: riderId, name: rider.name }]
-            );
-            setRequestNotice(`${rider.name} canceled their seat. A seat is now open.`);
-          },
+          onPress: () =>
+            runBoardAction(async () => {
+              // Marking the accepted request cancelled frees the seat, since
+              // available seats are always seat_count - accepted requests.
+              const { data, error } = await supabase
+                .from('ride_requests')
+                .update({ status: 'cancelled' })
+                .eq('id', rider.requestId)
+                .eq('status', 'accepted')
+                .select('id');
+              if (error || !data || data.length === 0) {
+                console.warn('CarpoolBoard: cancelling seat failed', error);
+                setRequestNotice("Couldn't cancel your seat. Check your connection and try again.");
+                return;
+              }
+              setLocalWaitingRiders((current) =>
+                current.some((r) => r.id === riderId)
+                  ? current
+                  : [...current, { id: riderId, name: rider.name }]
+              );
+              setRequestNotice(`${rider.name} canceled their seat. A seat is now open.`);
+            }),
         },
       ],
       { cancelable: true }
@@ -510,7 +956,7 @@ export default function App() {
       id: currentUser.id,
       name: currentUser.name,
     };
-    setRiders((current) => [...current, newRider]);
+    setLocalWaitingRiders((current) => [...current, newRider]);
 
     resetRiderForm();
   }
@@ -531,15 +977,23 @@ export default function App() {
         {
           text: 'Remove Me',
           style: 'destructive',
-          onPress: () => {
-            setRiders((current) => current.filter((r) => r.id !== riderId));
-            setDrivers((current) =>
-              current.map((d) => ({
-                ...d,
-                pendingRequests: d.pendingRequests.filter((req) => req.riderId !== riderId),
-              }))
-            );
-          },
+          onPress: () =>
+            runBoardAction(async () => {
+              const { error } = await supabase
+                .from('ride_requests')
+                .update({ status: 'cancelled' })
+                .eq('rider_id', riderId)
+                .eq('status', 'pending');
+              if (error) {
+                console.warn('CarpoolBoard: withdrawing requests failed', error);
+                Alert.alert(
+                  "Couldn't remove you",
+                  'Your pending requests could not be cancelled. Check your connection and try again.'
+                );
+                return;
+              }
+              setLocalWaitingRiders((current) => current.filter((r) => r.id !== riderId));
+            }),
         },
       ],
       { cancelable: true }
@@ -569,13 +1023,52 @@ export default function App() {
     currentUser !== null && riders.some((rider) => rider.id === currentUser.id);
 
   // Available Rides in the chosen order. Sorting a copy keeps `drivers`
-  // itself in posting order, which is what "Default" shows.
-  const sortedDrivers =
-    rideSortOrder === 'destination'
-      ? [...drivers].sort((a, b) =>
-          a.destination.localeCompare(b.destination, undefined, { sensitivity: 'base' })
-        )
-      : drivers;
+  // itself in posting order, which is what "Default" shows. Departure Time
+  // puts upcoming rides first (soonest at the front), then rides whose
+  // departure has already passed, each group in chronological order.
+  const nowMs = Date.now();
+  let sortedDrivers = drivers;
+  if (rideSortOrder === 'destination') {
+    sortedDrivers = [...drivers].sort((a, b) =>
+      a.destination.localeCompare(b.destination, undefined, { sensitivity: 'base' })
+    );
+  } else if (rideSortOrder === 'departure') {
+    sortedDrivers = [...drivers].sort((a, b) => {
+      const aTime = a.departureAt.getTime();
+      const bTime = b.departureAt.getTime();
+      const aPast = aTime < nowMs;
+      const bPast = bTime < nowMs;
+      if (aPast !== bPast) {
+        return aPast ? 1 : -1;
+      }
+      return aTime - bTime;
+    });
+  }
+
+  // The ride open in the form's Edit mode, if any.
+  const editingDriver =
+    editingRideId !== null ? drivers.find((driver) => driver.id === editingRideId) || null : null;
+
+  // Past days can't be picked on the date wheel. On the time wheel, earlier
+  // times are blocked only when the chosen day is today. No limit is set when
+  // editing a ride whose saved departure already passed, so the wheels still
+  // show its real value (saving a changed departure still requires a future time).
+  const departurePickerMinimumDate = (() => {
+    const now = new Date();
+    let minimum;
+    if (departurePickerMode === 'date') {
+      minimum = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    } else if (
+      departureAtInput !== null &&
+      departureAtInput.toDateString() === now.toDateString()
+    ) {
+      minimum = now;
+    }
+    if (minimum && departureAtInput !== null && departureAtInput < minimum) {
+      return undefined;
+    }
+    return minimum;
+  })();
 
   const showActionsRow = currentUser
     ? currentUser.role === 'driver'
@@ -584,7 +1077,7 @@ export default function App() {
     : false;
 
   if (currentUser === null) {
-    // Sign-in screen: local-only accounts, no networking or persistence yet.
+    // Sign-in screen: accounts are `profiles` rows in Supabase (no passwords).
     // Email is the account identifier; picking a name + role only applies
     // the first time an email is used. The rest of the app just reads
     // currentUser.role to decide what to show.
@@ -691,17 +1184,21 @@ export default function App() {
                 {authError !== '' && <Text style={styles.errorText}>{authError}</Text>}
 
                 <TouchableOpacity
-                  style={styles.saveDriverButton}
+                  style={[styles.saveDriverButton, isSigningIn && styles.rideCardButtonDisabled]}
                   onPress={handleSignIn}
+                  disabled={isSigningIn}
                   activeOpacity={0.85}
                 >
-                  <Text style={styles.buttonText}>Continue</Text>
+                  <Text style={[styles.buttonText, isSigningIn && styles.rideCardButtonTextDisabled]}>
+                    {isSigningIn ? 'Signing in…' : 'Continue'}
+                  </Text>
                 </TouchableOpacity>
 
                 <Text style={styles.authDisclaimer}>
-                  This is a class-project prototype login: accounts are kept only in this app's
-                  memory for this session, with no password and no real security. Don't use a
-                  real/sensitive password anywhere here.
+                  This is a class-project prototype login: your name, email, and role are saved to
+                  CarpoolBoard's shared database, with no password and no real security. Anyone
+                  who enters your email can sign in as you. Don't use a real/sensitive password
+                  anywhere here.
                 </Text>
               </View>
             </ScrollView>
@@ -780,6 +1277,14 @@ export default function App() {
         style={styles.scrollArea}
         contentContainerStyle={styles.container}
         keyboardShouldPersistTaps="handled"
+        refreshControl={
+          <RefreshControl
+            refreshing={isRefreshing}
+            onRefresh={handleRefresh}
+            tintColor="#3B6EF5"
+            colors={['#3B6EF5']}
+          />
+        }
       >
         {matchConfirmation ? (
           /* Match Confirmed screen: shown after a rider is matched to a driver */
@@ -1059,7 +1564,7 @@ export default function App() {
                         onPress={() => {
                           // Joins the shared waiting list automatically the first
                           // time a rider requests a ride, using their own account.
-                          setRiders((current) =>
+                          setLocalWaitingRiders((current) =>
                             current.some((r) => r.id === currentUser.id)
                               ? current
                               : [...current, { id: currentUser.id, name: currentUser.name }]
@@ -1081,6 +1586,16 @@ export default function App() {
                     );
                   })()
                 ))}
+
+              {isOwnerDriver && (
+                <TouchableOpacity
+                  style={styles.editRideButton}
+                  onPress={() => handleStartEditRide(detailsDriver.id)}
+                  activeOpacity={0.85}
+                >
+                  <Text style={styles.editRideButtonText}>Edit Ride</Text>
+                </TouchableOpacity>
+              )}
 
               {isOwnerDriver && (
                 <TouchableOpacity
@@ -1147,8 +1662,8 @@ export default function App() {
               </View>
 
               <Text style={styles.authDisclaimer}>
-                This account is a local class-project prototype: it lives only in this app's
-                memory for this session, with no password or real authentication yet.
+                This account is a class-project prototype: it's saved in CarpoolBoard's shared
+                database, with no password or real authentication yet.
               </Text>
 
               <TouchableOpacity
@@ -1190,7 +1705,24 @@ export default function App() {
           </View>
         )}
 
-        {drivers.length === 0 ? (
+        {/* A failed load keeps any rides already shown; this just explains why
+            they may be out of date. */}
+        {boardError !== '' && (
+          <View style={styles.noticeBox}>
+            <Text style={styles.noticeText}>{boardError}</Text>
+          </View>
+        )}
+
+        {drivers.length === 0 && isBoardLoading ? (
+          <View style={styles.emptyCard}>
+            <ActivityIndicator color="#3B6EF5" />
+            <Text style={[styles.emptyMessage, styles.loadingMessage]}>Loading rides…</Text>
+          </View>
+        ) : drivers.length === 0 && boardError !== '' ? (
+          <View style={styles.emptyCard}>
+            <Text style={styles.emptyMessage}>Rides couldn't be loaded.</Text>
+          </View>
+        ) : drivers.length === 0 ? (
           <View style={styles.emptyCard}>
             <Text style={styles.emptyMessage}>No rides posted yet.</Text>
           </View>
@@ -1316,11 +1848,14 @@ export default function App() {
           <View style={styles.section}>
             <View style={styles.sectionHeaderRow}>
               <View style={[styles.sectionAccent, styles.sectionAccentDriver]} />
-              <Text style={styles.sectionTitle}>Offer a Ride</Text>
+              <Text style={styles.sectionTitle}>
+                {editingRideId !== null ? 'Edit Ride' : 'Offer a Ride'}
+              </Text>
             </View>
 
             <Text style={styles.formHint}>
-              Posting as <Text style={styles.formHintStrong}>{currentUser.name}</Text>
+              {editingRideId !== null ? 'Editing as ' : 'Posting as '}
+              <Text style={styles.formHintStrong}>{currentUser.name}</Text>
             </Text>
 
             <Text style={styles.authLabel}>Where are you going?</Text>
@@ -1330,18 +1865,69 @@ export default function App() {
               placeholderTextColor="#9AA3B2"
               value={destinationInput}
               onChangeText={setDestinationInput}
-              returnKeyType="next"
+              onFocus={() => setDeparturePickerMode(null)}
+              returnKeyType="done"
+              onSubmitEditing={Keyboard.dismiss}
             />
 
+            {/* Departure is picked on native scrolling wheels instead of typed:
+                one wheel for the day and one for the time, combined into a
+                single Date. On iPhone the wheels appear inline (spinner
+                style); on Android the system date/time dialogs are used. */}
             <Text style={styles.authLabel}>When are you leaving?</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="Departure time (e.g. 5:30 PM)"
-              placeholderTextColor="#9AA3B2"
-              value={departureTimeInput}
-              onChangeText={setDepartureTimeInput}
-              returnKeyType="next"
-            />
+            <View style={[styles.input, styles.departureDisplay]}>
+              <Text
+                style={
+                  departureAtInput !== null
+                    ? styles.departureDisplayText
+                    : styles.departureDisplayPlaceholder
+                }
+              >
+                {departureAtInput !== null
+                  ? formatDeparture(departureAtInput)
+                  : 'Choose a departure date and time'}
+              </Text>
+            </View>
+            <View style={styles.departureButtonRow}>
+              {[
+                { mode: 'date', label: 'Date' },
+                { mode: 'time', label: 'Time' },
+              ].map((option) => {
+                const isActive = departurePickerMode === option.mode;
+                return (
+                  <TouchableOpacity
+                    key={option.mode}
+                    style={[styles.departureButton, isActive && styles.departureButtonActive]}
+                    onPress={() => handleToggleDeparturePicker(option.mode)}
+                    activeOpacity={0.85}
+                  >
+                    <Text
+                      style={[styles.departureButtonText, isActive && styles.departureButtonTextActive]}
+                    >
+                      {isActive ? 'Done' : `Pick ${option.label}`}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+
+            {departurePickerMode !== null && departureAtInput !== null && (
+              <View style={Platform.OS === 'ios' ? styles.departurePickerBox : null}>
+                <DateTimePicker
+                  key={departurePickerMode}
+                  value={departureAtInput}
+                  mode={departurePickerMode}
+                  display={Platform.OS === 'ios' ? 'spinner' : 'default'}
+                  minimumDate={departurePickerMinimumDate}
+                  minuteInterval={DEPARTURE_MINUTE_INTERVAL}
+                  themeVariant="light"
+                  textColor="#16213E"
+                  locale="en-US"
+                  onValueChange={(event, date) => handleDeparturePicked(date)}
+                  onDismiss={() => setDeparturePickerMode(null)}
+                />
+              </View>
+            )}
 
             {/* iOS has no Return key on a number pad, but pairing
                 returnKeyType="done" with a number-pad keyboardType makes iOS
@@ -1357,10 +1943,18 @@ export default function App() {
               placeholderTextColor="#9AA3B2"
               value={seatsInput}
               onChangeText={(text) => setSeatsInput(text.replace(/[^0-9]/g, ''))}
+              onFocus={() => setDeparturePickerMode(null)}
               keyboardType="number-pad"
               returnKeyType="done"
               onSubmitEditing={Keyboard.dismiss}
             />
+            {editingDriver !== null && editingDriver.matchedRiders.length > 0 && (
+              <Text style={styles.formHint}>
+                {editingDriver.matchedRiders.length} confirmed rider
+                {editingDriver.matchedRiders.length === 1 ? '' : 's'} — total seats can't go
+                below that.
+              </Text>
+            )}
 
             {formError !== '' && <Text style={styles.errorText}>{formError}</Text>}
 
@@ -1370,7 +1964,9 @@ export default function App() {
               disabled={isSubmittingDriver}
               activeOpacity={0.85}
             >
-              <Text style={styles.buttonText}>Post Ride</Text>
+              <Text style={styles.buttonText}>
+                {editingRideId !== null ? 'Save Changes' : 'Post Ride'}
+              </Text>
             </TouchableOpacity>
 
             <TouchableOpacity
@@ -2329,5 +2925,73 @@ const styles = StyleSheet.create({
   },
   sortOptionTextActive: {
     color: '#fff',
+  },
+
+  // "Loading rides…" text under the spinner in the empty card
+  loadingMessage: {
+    marginTop: 8,
+  },
+
+  // Owner's Edit Ride button on Ride Details (sits above Cancel Ride)
+  editRideButton: {
+    backgroundColor: '#EEF3FF',
+    borderRadius: 14,
+    paddingVertical: 14,
+    alignItems: 'center',
+    marginTop: 4,
+    marginBottom: 10,
+  },
+  editRideButtonText: {
+    color: '#3B6EF5',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+
+  // Departure date/time wheels in the Post Ride form
+  departureDisplay: {
+    justifyContent: 'center',
+  },
+  departureDisplayText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#1A2333',
+  },
+  departureDisplayPlaceholder: {
+    fontSize: 16,
+    color: '#9AA3B2',
+  },
+  departureButtonRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginBottom: 12,
+  },
+  departureButton: {
+    flex: 1,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#DADFE6',
+    paddingVertical: 10,
+    alignItems: 'center',
+    backgroundColor: '#FAFBFC',
+  },
+  departureButtonActive: {
+    backgroundColor: '#3B6EF5',
+    borderColor: '#3B6EF5',
+  },
+  departureButtonText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#3B6EF5',
+  },
+  departureButtonTextActive: {
+    color: '#fff',
+  },
+  departurePickerBox: {
+    backgroundColor: '#FAFBFC',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#DADFE6',
+    marginBottom: 12,
+    overflow: 'hidden',
   },
 });
